@@ -1,0 +1,13 @@
+{
+  "name": "eth-perp-analysis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ETH/USDT 永续合约多周期K线分析报告（静态页面）",
+  "scripts": {
+    "start": "serve . -l 3000",
+    "dev": "serve . -l 3000"
+  },
+  "devDependencies": {
+    "serve": "^14.2.4"
+  }
+}
