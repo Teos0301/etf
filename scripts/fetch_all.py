@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""ETH/USDT 永续多周期抓取 v3
-策略: 欧易优先(带重试, 偶发断连自动恢复), K线失败的周期先走币安国内镜像(快, 现货),
-再不行用 Gate 永续补齐; meta 欧易→Gate(保永续费率/持仓)→币安镜像兜底。
+"""ETH/USDT 永续多周期抓取 v4
+策略: Gate 永续为主(带重试), 探活失败整轮跳过;
+K线失败周期按 Gate → HTX(api.hbdm.vn) → Hyperliquid 降级;
+meta 同链路 Gate → HTX → Hyperliquid, 三者都提供永续资金费率/持仓量。
+注意: Hyperliquid 资金费率按小时结算, 写入前统一折算成 8h 口径。
 输出 klines.json: {timeframes:{tf:[[ts_ms,o,h,l,c,vol_eth,vol_usdt]...]}...}
 """
 import json
@@ -21,7 +23,8 @@ H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
 BARS = 300
 TFS = ["1m", "5m", "15m", "1h", "4h", "1d"]
-OKX_BAR = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
+HTX_PERIOD = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "60min", "4h": "4hour", "1d": "1day"}
+HL_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
 def _get(url, params=None, timeout=8, retries=3):
@@ -37,28 +40,28 @@ def _get(url, params=None, timeout=8, retries=3):
     raise last
 
 
-def okx_alive():
-    # 轻量探活: 一次4秒超时, 挂了就整轮跳过OKX, 避免全周期重试拖时间
+def _post(url, payload, timeout=8, retries=4):
+    # Hyperliquid 偶发 SSL 握手失败, 多给一次重试
+    last = None
+    for i in range(retries):
+        try:
+            r = requests.post(url, json=payload, timeout=timeout, headers=H)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(0.3 * (i + 1))
+    raise last
+
+
+def gate_alive():
+    # 轻量探活: 一次4秒超时, 挂了就整轮跳过 Gate, 避免全周期重试拖时间
     try:
-        _get("https://www.okx.com/api/v5/public/time", timeout=4, retries=1)
+        _get("https://fx-api.gateio.ws/api/v4/futures/usdt/tickers",
+             {"contract": "ETH_USDT"}, timeout=4, retries=1)
         return True
     except Exception:
         return False
-
-
-def okx_klines(tf):
-    data = _get("https://www.okx.com/api/v5/market/candles",
-                {"instId": "ETH-USDT-SWAP", "bar": OKX_BAR[tf], "limit": BARS})
-    if str(data.get("code")) != "0" or not data.get("data"):
-        raise RuntimeError("okx %s code=%s" % (tf, data.get("code")))
-    # [ts,o,h,l,c,vol张,volCcy(ETH),volCcyQuote(USDT),confirm] 新->旧
-    rows = sorted([[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]),
-                    float(k[6] if len(k) > 6 else k[5]),
-                    float(k[7] if len(k) > 7 else 0)] for k in data["data"]],
-                  key=lambda r: r[0])
-    if len(rows) < 60:
-        raise RuntimeError("okx %s rows=%d" % (tf, len(rows)))
-    return rows
 
 
 def gate_klines(tf):
@@ -71,66 +74,31 @@ def gate_klines(tf):
     return rows
 
 
-def binance_vision_klines(tf):
-    # data-api.binance.vision 是币安官方"仅行情"域名, 国内可直连; 只有现货, 无合约
-    data = _get("https://data-api.binance.vision/api/v3/klines",
-                {"symbol": "ETHUSDT", "interval": tf, "limit": BARS})
-    # [开时间,o,h,l,c,量ETH,收时间,成交额USDT,...]
-    rows = sorted([[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]),
-                    float(k[5]), float(k[7])] for k in data], key=lambda r: r[0])
+def htx_klines(tf):
+    data = _get("https://api.hbdm.vn/linear-swap-ex/market/history/kline",
+                {"contract_code": "ETH-USDT", "period": HTX_PERIOD[tf], "size": BARS})
+    if data.get("status") != "ok" or not data.get("data"):
+        raise RuntimeError("htx %s status=%s" % (tf, data.get("status")))
+    # id(秒) o h l c, amount=成交量(ETH), trade_turnover=成交额(USDT); 新->旧
+    rows = sorted([[int(x["id"]) * 1000, float(x["open"]), float(x["high"]), float(x["low"]),
+                    float(x["close"]), float(x.get("amount") or 0), float(x.get("trade_turnover") or 0)]
+                   for x in data["data"]], key=lambda r: r[0])
     if len(rows) < 60:
-        raise RuntimeError("binance %s rows=%d" % (tf, len(rows)))
+        raise RuntimeError("htx %s rows=%d" % (tf, len(rows)))
     return rows
 
 
-def binance_vision_meta():
-    tk = _get("https://data-api.binance.vision/api/v3/ticker/24hr", {"symbol": "ETHUSDT"})
-    m = {}
-    m["lastPrice"] = float(tk["lastPrice"])
-    m["chg24hPct"] = float(tk["priceChangePercent"])
-    m["high24h"] = float(tk["highPrice"])
-    m["low24h"] = float(tk["lowPrice"])
-    m["vol24hQuote"] = float(tk["quoteVolume"])
-    m["markPrice"] = m["lastPrice"]
-    m["indexPrice"] = m["lastPrice"]
-    m["fundingRate"] = 0.0
-    m["nextFundingTime"] = 0
-    m["openInterestETH"] = 0
-    m["openInterestUSD"] = 0
-    return m
-
-
-def okx_meta():
-    tk = _get("https://www.okx.com/api/v5/market/ticker", {"instId": "ETH-USDT-SWAP"})["data"][0]
-    fr = _get("https://www.okx.com/api/v5/public/funding-rate", {"instId": "ETH-USDT-SWAP"})["data"][0]
-    oi = _get("https://www.okx.com/api/v5/public/open-interest",
-              {"instType": "SWAP", "instId": "ETH-USDT-SWAP"})["data"][0]
-    m = {}
-    m["lastPrice"] = float(tk["last"])
-    m["chg24hPct"] = round((float(tk["last"]) / float(tk["open24h"]) - 1) * 100, 3)
-    m["high24h"] = float(tk["high24h"])
-    m["low24h"] = float(tk["low24h"])
-    m["vol24hQuote"] = float(tk.get("volCcy24h") or 0) * float(tk["last"])
-    m["fundingRate"] = float(fr["fundingRate"])
-    m["nextFundingTime"] = int(fr["nextFundingTime"])
-    m["openInterestETH"] = round(float(oi.get("oiCcy") or 0))
-    m["openInterestUSD"] = round(m["openInterestETH"] * m["lastPrice"])
-    try:
-        mp = _get("https://www.okx.com/api/v5/public/mark-price",
-                  {"instId": "ETH-USDT-SWAP", "markPxType": "index_price_1"})["data"][0]
-        m["markPrice"] = float(mp["markPx"])
-        m["indexPrice"] = float(mp.get("indexPx") or 0)
-    except Exception:
-        m["markPrice"] = float(fr.get("markPx") or 0)
-        m["indexPrice"] = 0.0
-    try:
-        fh = _get("https://www.okx.com/api/v5/public/funding-rate-history",
-                  {"instId": "ETH-USDT-SWAP", "limit": "8"})["data"]
-        m["fundingHistory"] = [[int(x.get("fundingTime") or x.get("ts") or 0),
-                                float(x["fundingRate"])] for x in reversed(fh)]
-    except Exception:
-        pass
-    return m
+def hl_klines(tf):
+    start = int(time.time() * 1000) - (BARS + 2) * HL_SEC[tf] * 1000
+    data = _post("https://api.hyperliquid.xyz/info",
+                 {"type": "candleSnapshot",
+                  "req": {"coin": "ETH", "interval": tf, "startTime": start}})
+    # t(ms) o h l c v(ETH), 无成交额, 用收盘价估算 USDT 额
+    rows = sorted([[int(x["t"]), float(x["o"]), float(x["h"]), float(x["l"]), float(x["c"]),
+                    float(x["v"]), float(x["v"]) * float(x["c"])] for x in data], key=lambda r: r[0])
+    if len(rows) < 60:
+        raise RuntimeError("hl %s rows=%d" % (tf, len(rows)))
+    return rows
 
 
 def gate_meta():
@@ -153,56 +121,124 @@ def gate_meta():
     return m
 
 
+def htx_meta():
+    tk = _get("https://api.hbdm.vn/linear-swap-ex/market/detail/merged",
+              {"contract_code": "ETH-USDT"})["tick"]
+    fr = _get("https://api.hbdm.vn/linear-swap-api/v1/swap_funding_rate",
+              {"contract_code": "ETH-USDT"})["data"]
+    oi = _get("https://api.hbdm.vn/linear-swap-api/v1/swap_open_interest",
+              {"contract_code": "ETH-USDT"})["data"][0]
+    # merged 接口的 open/high/low 是"当日"口径, 24h 指标用最近 25 根 1h K线自己算
+    ks = sorted(_get("https://api.hbdm.vn/linear-swap-ex/market/history/kline",
+                     {"contract_code": "ETH-USDT", "period": "60min", "size": 25})["data"],
+                key=lambda x: int(x["id"]))
+    win = ks[-24:]
+    last = float(tk["close"])
+    ref = float(ks[-25]["close"]) if len(ks) >= 25 else last
+    m = {}
+    m["lastPrice"] = last
+    m["chg24hPct"] = round((last / ref - 1) * 100, 3) if ref else 0.0
+    m["high24h"] = max(float(x["high"]) for x in win)
+    m["low24h"] = min(float(x["low"]) for x in win)
+    m["vol24hQuote"] = float(tk.get("trade_turnover") or 0)
+    m["markPrice"] = last
+    try:
+        idx = _get("https://api.hbdm.vn/linear-swap-api/v1/swap_index",
+                   {"contract_code": "ETH-USDT"})["data"][0]
+        m["indexPrice"] = float(idx.get("index_price") or last)
+    except Exception:
+        m["indexPrice"] = last
+    m["fundingRate"] = float(fr.get("funding_rate") or 0)
+    m["nextFundingTime"] = int(fr.get("funding_time") or 0)
+    m["openInterestETH"] = round(float(oi.get("amount") or 0))
+    m["openInterestUSD"] = round(float(oi.get("value") or 0))
+    return m
+
+
+def hl_meta():
+    data = _post("https://api.hyperliquid.xyz/info", {"type": "metaAndAssetCtxs"})
+    ctx = data[1][[u["name"] for u in data[0]["universe"]].index("ETH")]
+    last = float(ctx.get("midPx") or ctx.get("markPx"))
+    prev = float(ctx.get("prevDayPx") or last)
+    # 该源不给 24h 高低, 用最近 24 根 1h K线聚合
+    highs, lows = [], []
+    try:
+        cs = _post("https://api.hyperliquid.xyz/info",
+                   {"type": "candleSnapshot",
+                    "req": {"coin": "ETH", "interval": "1h",
+                            "startTime": int(time.time() * 1000) - 25 * 3600 * 1000}})
+        highs = [float(c["h"]) for c in cs[-24:]]
+        lows = [float(c["l"]) for c in cs[-24:]]
+    except Exception:
+        pass
+    m = {}
+    m["lastPrice"] = last
+    m["chg24hPct"] = round((last / prev - 1) * 100, 3) if prev else 0.0
+    m["high24h"] = max(highs) if highs else last
+    m["low24h"] = min(lows) if lows else last
+    m["vol24hQuote"] = float(ctx.get("dayNtlVlm") or 0)
+    m["markPrice"] = float(ctx.get("markPx") or last)
+    m["indexPrice"] = float(ctx.get("oraclePx") or last)
+    # 每小时结算, 折算成 8h 口径后再写入
+    m["fundingRate"] = float(ctx.get("funding") or 0) * 8
+    nxt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    m["nextFundingTime"] = int(nxt.timestamp() * 1000)
+    m["openInterestETH"] = round(float(ctx.get("openInterest") or 0))
+    m["openInterestUSD"] = round(m["openInterestETH"] * last)
+    return m
+
+
 def main():
     t0 = time.time()
-    result = {"exchange": "okx", "label": "欧易 OKX ETH-USDT 永续", "timeframes": {}, "meta": {}}
+    result = {"exchange": "gateio", "label": "Gate.io ETH/USDT 永续", "timeframes": {}, "meta": {}}
     src_map = {}
 
-    # K线: 欧易并发3, 失败周期先试币安镜像(快)再用 Gate 补
-    use_okx = okx_alive()
-    if not use_okx:
-        print("[INFO] OKX 探活失败, 本轮跳过欧易")
-    with ThreadPoolExecutor(3) as ex:
-        futs = {tf: ex.submit(okx_klines, tf) for tf in TFS} if use_okx else {}
-        failed = [] if use_okx else list(TFS)
-        for tf in TFS:
-            if tf in futs:
-                try:
-                    result["timeframes"][tf] = futs[tf].result()
-                    src_map[tf] = "OKX"
-                except Exception:
-                    failed.append(tf)
-    for tf in failed:
-        for fn, src in ((binance_vision_klines, "Binance"), (gate_klines, "Gate")):
+    # K线: Gate -> HTX -> Hyperliquid, 逐周期降级, 并发3
+    use_gate = gate_alive()
+    if not use_gate:
+        print("[INFO] Gate 探活失败, 本轮跳过 Gate")
+
+    def fetch_kline(tf):
+        chain = ([(gate_klines, "Gate")] if use_gate else []) + [(htx_klines, "HTX"), (hl_klines, "HL")]
+        err = None
+        for fn, src in chain:
             try:
-                result["timeframes"][tf] = fn(tf)
+                return src, fn(tf)
+            except Exception as e:
+                err = e
+        raise RuntimeError("%s 三个源都失败: %s" % (tf, err))
+
+    with ThreadPoolExecutor(3) as ex:
+        futs = {tf: ex.submit(fetch_kline, tf) for tf in TFS}
+        for tf in TFS:
+            try:
+                src, rows = futs[tf].result()
+                result["timeframes"][tf] = rows
                 src_map[tf] = src
-                break
-            except Exception:
-                continue
-        if tf not in src_map:
-            print("[ERR] %s 三个源都失败" % tf)
-            sys.exit(1)
+            except Exception as e:
+                print("[ERR] %s" % e)
+                sys.exit(1)
 
-    # meta: 欧易优先, Gate 保永续费率/持仓, 都挂才用币安现货镜像
-    if use_okx:
+    # meta: Gate 优先, 其次 HTX, 最后 Hyperliquid(费率折算8h)
+    for fn, label, ex_name in ((gate_meta, "Gate.io ETH/USDT 永续", "gateio"),
+                               (htx_meta, "HTX 火币 ETH/USDT 永续(备用源)", "htx"),
+                               (hl_meta, "Hyperliquid ETH 永续(备用源, 费率已折算为8h)", "hyperliquid")):
         try:
-            result["meta"] = okx_meta()
+            result["meta"] = fn()
+            result["label"] = label
+            result["exchange"] = ex_name
+            break
         except Exception:
-            pass
+            continue
     if not result["meta"]:
-        try:
-            result["meta"] = gate_meta()
-            result["label"] = "Gate.io ETH/USDT 永续(备用源)"
-            result["exchange"] = "gateio"
-        except Exception:
-            result["meta"] = binance_vision_meta()
-            result["label"] = "币安现货镜像 binance.vision (ETHUSDT)"
-            result["exchange"] = "binance-spot"
+        print("[ERR] 三个源的 meta 都失败")
+        sys.exit(1)
 
-    mixed = len(set(src_map.values())) > 1
-    if mixed:
-        result["label"] += " (混合: " + ", ".join("%s=%s" % (k, v) for k, v in src_map.items() if v != "OKX") + ")"
+    # K线来源与 meta 源不一致时, 在 label 里如实标出
+    src_name = {"gateio": "Gate", "htx": "HTX", "hyperliquid": "HL"}[result["exchange"]]
+    off = [(tf, s) for tf, s in src_map.items() if s != src_name]
+    if off:
+        result["label"] += " (混合: " + ", ".join("%s=%s" % (k, v) for k, v in off) + ")"
 
     result["fetchedAt"] = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
     result["fetchedTs"] = int(time.time() * 1000)
