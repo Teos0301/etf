@@ -10,13 +10,37 @@
 ├── ETH永续合约_多周期K线分析_1501.html  # 15:01 快照
 ├── ETH永续合约_多周期K线分析_1601.html  # 16:01 快照
 ├── ETH永续合约_多周期K线分析_2301.html  # 23:01 快照
-├── analysis/                           # 抓数与报告生成的脚本
-│   ├── gen_plans.py                    # 指标计算 + 方案输出
-│   ├── gen_training_v2.py              # 报告 HTML 生成
+├── analysis/                           # 招标标书相关的文本抽取与生成脚本
+│   ├── gen_plans.py                    # 方案生成
+│   ├── gen_training_v2.py              # 培训文档生成
 │   ├── bid_extract.txt                 # 招标文件抽取的原始文本
 │   └── criteria_pages.txt              # 评分标准页文本
+├── scripts/                            # 行情抓取与分析脚本
+│   ├── check_prices.py                 # ETH/ZEC 现价快查
+│   ├── eth_timeline.py                 # 4h/1h 时间线
+│   ├── fetch_all.py                    # 全量抓取 -> klines.json
+│   ├── compute.py                      # 指标与策略引擎 -> summary.json
+│   ├── build_html.py                   # 组装自包含报告
+│   └── report_template.html            # 报告模板
+├── .trae/rules/project_rules.md        # 项目规则（数据源/风控/输出结构）
 └── .trae-html-share-packages/          # HTML 分享包缓存
 ```
+
+## 行情脚本
+
+```bash
+pip install requests
+python scripts/check_prices.py
+python scripts/eth_timeline.py
+# 需要重出报告时：
+python scripts/fetch_all.py && python scripts/compute.py && python scripts/build_html.py
+```
+
+脚本使用相对路径并自动切换到自身目录，在任意工作目录执行都可以。`klines.json` / `summary.json` 是运行产物，已加入 `.gitignore`。
+
+## 项目约定
+
+数据源、账户风控、输出格式等硬性约定见 [.trae/rules/project_rules.md](.trae/rules/project_rules.md)。该文件随仓库分发，新工作区打开后自动生效。
 
 ## 本地运行
 

@@ -7,3 +7,11 @@ Thumbs.db
 
 # 文档产物，不入库
 *.docx
+
+# Python
+__pycache__/
+*.pyc
+
+# 行情运行产物（每次抓取重新生成）
+scripts/klines.json
+scripts/summary.json
